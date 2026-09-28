@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -17,6 +17,7 @@ from status.batch import (
     run_batch_operation,
 )
 from status.collectors import run_collect
+from status.collectors.payload import resolve_week_ending
 from status.config import SKILLS_DIR, get_settings
 from status.db import get_session
 from status.skills.client import SkillClient
@@ -38,10 +39,6 @@ console = Console()
 log = logging.getLogger(__name__)
 
 
-def _parse_week(value: str) -> date:
-    return datetime.strptime(value, "%Y-%m-%d").date()
-
-
 def _dry_run_flag(dry_run: bool) -> None:
     if dry_run:
         console.print("[yellow]dry-run: no external calls or persistence[/]")
@@ -56,7 +53,12 @@ def _exit_for_batch_failures(failures: list[BatchResult]) -> None:
 @app.command()
 def collect(
     person: Annotated[str, typer.Option("--person", "-p", help="Person ID")],
-    week: Annotated[str, typer.Option("--week", "-w", help="Week ending Friday (YYYY-MM-DD)")],
+    week: Annotated[
+        Optional[str],
+        typer.Option(
+            "--week", "-w", help="Week ending Friday (YYYY-MM-DD). Defaults to the most recent Friday."
+        ),
+    ] = None,
     save_fixture: Annotated[
         Optional[Path], typer.Option("--save-fixture", help="Write payload JSON to this path")
     ] = None,
@@ -70,7 +72,7 @@ def collect(
 ) -> None:
     """Collect Jira and GitHub activity for one person and one week."""
     _dry_run_flag(dry_run)
-    week_ending = _parse_week(week)
+    week_ending = resolve_week_ending(week)
     payload = run_collect(
         person,
         week_ending,
@@ -91,7 +93,10 @@ def draft(
         Optional[str], typer.Option("--person", "-p", help="Person ID (collects live data)")
     ] = None,
     week: Annotated[
-        Optional[str], typer.Option("--week", "-w", help="Week ending Friday (YYYY-MM-DD)")
+        Optional[str],
+        typer.Option(
+            "--week", "-w", help="Week ending Friday (YYYY-MM-DD). Defaults to the most recent Friday."
+        ),
     ] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Skip skill invocation")] = False,
     no_persist: Annotated[
@@ -107,10 +112,10 @@ def draft(
         except FileNotFoundError as exc:
             console.print(f"[red]{exc}[/]")
             raise typer.Exit(1) from exc
-    elif person and week:
-        payload = run_collect(person, _parse_week(week))
+    elif person:
+        payload = run_collect(person, resolve_week_ending(week))
     else:
-        console.print("[red]Provide --fixture or both --person and --week[/]")
+        console.print("[red]Provide --fixture or --person[/]")
         raise typer.Exit(1)
 
     if dry_run or no_persist:
@@ -134,12 +139,15 @@ def draft(
 @app.command()
 def send(
     person: Annotated[str, typer.Option("--person", "-p")],
-    week: Annotated[str, typer.Option("--week", "-w")],
+    week: Annotated[
+        Optional[str],
+        typer.Option("--week", "-w", help="Defaults to the most recent Friday."),
+    ] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     """Send a draft review DM via Slack."""
     _dry_run_flag(dry_run)
-    week_ending = _parse_week(week)
+    week_ending = resolve_week_ending(week)
     settings = get_settings()
 
     # Enforce pilot filtering
@@ -186,7 +194,10 @@ def slack_run() -> None:
 
 @app.command(name="report")
 def report_cmd(
-    week: Annotated[str, typer.Option("--week", "-w")],
+    week: Annotated[
+        Optional[str],
+        typer.Option("--week", "-w", help="Defaults to the most recent Friday."),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option(
@@ -216,7 +227,7 @@ def report_cmd(
 ) -> None:
     """Synthesize the management report for a week."""
     _dry_run_flag(dry_run)
-    week_ending = _parse_week(week)
+    week_ending = resolve_week_ending(week)
     write_file = output
     if write_file is None and (persist or deliver) and not dry_run:
         write_file = Path(default_report_filename(week_ending))
