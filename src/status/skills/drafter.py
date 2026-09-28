@@ -37,11 +37,23 @@ log = logging.getLogger(__name__)
 GITHUB_REPO_URL_RE = re.compile(
     r"https://github\.com/(?P<repo>[^/\s)]+/[^/\s)]+)(?:/(?:pull|commit)/|[\s)]|$)"
 )
+INTERNAL_DRAFT_LANGUAGE_RE = re.compile(
+    r"listed as|supplied data|transition history|recorded only as reporter|"
+    r"conflicted with the description|no (?:linked|corresponding) jira|"
+    r"assigned to .+ reporter",
+    re.IGNORECASE,
+)
 
 DRAFTER_INSTRUCTION = (
     "Use the weekly-status-drafter skill on the payload below. "
     "Return only the JSON output defined in the skill as plain text in your reply. "
-    "Use markdown links [text](url) in outcome fields for Jira and GitHub evidence."
+    "Use markdown links [text](url) in outcome fields for Jira and GitHub evidence. "
+    "Critical review constraints: summarize the technical purpose of related PRs instead "
+    "of listing them; use at most two GitHub links in any outcome and keep every supporting "
+    "URL in evidence; accept an unambiguous repository_epic_hint when the subjects match; "
+    "and omit collector diagnostics about missing Jira links, assignees, reporters, payloads, "
+    "or transition history. A Jira issue with is_assignee=false may supply its parent epic as "
+    "grouping context, but do not cite that issue or claim its status as this person's work."
 )
 
 
@@ -343,6 +355,75 @@ def merge_hinted_repository_entries(
     return draft.model_copy(update={"entries": merged})
 
 
+def draft_quality_issues(
+    draft: DraftOutput,
+    payload: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return management-facing quality failures that warrant one model retry."""
+    issues: list[str] = []
+    jira_issues = {
+        str(issue.get("key")): issue
+        for issue in (payload or {}).get("jira_issues") or []
+        if issue.get("key")
+    }
+    for entry in draft.entries:
+        if entry.outcome.count("https://github.com/") > 2:
+            issues.append(
+                f"{entry.epic_key or entry.project} lists more than two GitHub links "
+                "instead of summarizing the combined technical result"
+            )
+        if INTERNAL_DRAFT_LANGUAGE_RE.search(entry.outcome):
+            issues.append(
+                f"{entry.epic_key or entry.project} uses internal collector language"
+            )
+        unowned_keys = [
+            key
+            for key in jira_keys_from_evidence(entry.evidence)
+            if jira_issues.get(key, {}).get("is_assignee") is False
+        ]
+        if unowned_keys:
+            issues.append(
+                f"{entry.epic_key or entry.project} cites reporter-only Jira work "
+                f"({', '.join(unowned_keys)}) instead of using it only as grouping context"
+            )
+    if any(INTERNAL_DRAFT_LANGUAGE_RE.search(flag) for flag in draft.flags):
+        issues.append("flags expose internal Jira or collector diagnostics")
+    return list(dict.fromkeys(issues))
+
+
+def compact_excessive_pr_outcomes(
+    draft: DraftOutput,
+    payload: dict[str, Any],
+) -> DraftOutput:
+    """Bound link-heavy outcomes if the model misses the rule after its retry."""
+    pull_requests_by_url = {
+        str(pr.get("url")): pr
+        for pr in payload.get("pull_requests") or []
+        if pr.get("url")
+    }
+    entries: list[DraftEntry] = []
+    for entry in draft.entries:
+        if entry.outcome.count("https://github.com/") <= 2:
+            entries.append(entry)
+            continue
+        pull_requests = [
+            pull_requests_by_url[item]
+            for item in entry.evidence
+            if item in pull_requests_by_url
+        ]
+        entries.append(
+            entry.model_copy(
+                update={"outcome": _pr_outcome(pull_requests)}
+                if pull_requests
+                else {}
+            )
+        )
+    flags = [
+        flag for flag in draft.flags if not INTERNAL_DRAFT_LANGUAGE_RE.search(flag)
+    ]
+    return draft.model_copy(update={"entries": entries, "flags": flags})
+
+
 def ensure_pr_only_entries(draft: DraftOutput, payload: dict[str, Any]) -> DraftOutput:
     """Add grounded repository entries for collected PRs the model omitted."""
     cited = {item for entry in draft.entries for item in entry.evidence}
@@ -489,6 +570,7 @@ def run_drafter(payload: dict[str, Any], *, dry_run: bool = False) -> DraftOutpu
         )
 
     last_error: SkillError | OpenAISkillError | None = None
+    last_quality_issues: list[str] = []
     for attempt in range(2):
         try:
             result = invoke_skill_json(
@@ -502,12 +584,44 @@ def run_drafter(payload: dict[str, Any], *, dry_run: bool = False) -> DraftOutpu
             assert isinstance(result, DraftOutput)
             normalized = _normalize_draft(result, payload)
             labeled = attach_evidence_labels(normalized, payload)
-            return postprocess_draft(labeled, skill_payload)
+            processed = postprocess_draft(labeled, skill_payload)
+            quality_issues = draft_quality_issues(processed, skill_payload)
+            if quality_issues and attempt == 0:
+                last_quality_issues = quality_issues
+                instruction = (
+                    f"{DRAFTER_INSTRUCTION}\n\nYour previous draft failed review: "
+                    f"{'; '.join(quality_issues)}. Rewrite it rather than defending it."
+                )
+                log.warning("drafter quality retry: %s", "; ".join(quality_issues))
+                continue
+            if quality_issues:
+                processed = compact_excessive_pr_outcomes(processed, skill_payload)
+                unresolved = draft_quality_issues(processed, skill_payload)
+                if unresolved:
+                    log.error(
+                        "drafter failed quality review after retry: %s",
+                        "; ".join(unresolved),
+                    )
+                    return _empty_draft(
+                        payload,
+                        flags=[
+                            (
+                                "drafter failed quality review after retry: "
+                                f"{'; '.join(unresolved)}"
+                            )
+                        ],
+                    )
+            return processed
         except (SkillError, OpenAISkillError) as exc:
             last_error = exc
             log.warning("drafter attempt %s failed: %s", attempt + 1, exc)
 
-    flag = f"drafter failed after retry: {last_error}" if last_error else "drafter failed after retry"
+    if last_error:
+        flag = f"drafter failed after retry: {last_error}"
+    elif last_quality_issues:
+        flag = f"drafter failed quality review after retry: {'; '.join(last_quality_issues)}"
+    else:
+        flag = "drafter failed after retry"
     return _empty_draft(payload, flags=[flag])
 
 

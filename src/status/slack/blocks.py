@@ -35,6 +35,8 @@ STATE_LABELS: dict[str, str] = {
 
 INTERNAL_FLAG_PHRASES = (
     "lacked jira link",
+    "no corresponding jira",
+    "no linked jira",
     "recorded only as reporter",
     "status conflicted",
     "current status in this payload",

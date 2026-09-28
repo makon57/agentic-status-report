@@ -187,6 +187,7 @@ def test_build_draft_blocks_lists_entries_before_flags() -> None:
 def test_build_draft_blocks_hides_internal_collector_diagnostics() -> None:
     flags = [
         MagicMock(message="All merged PRs lacked Jira links; assignment needs confirmation."),
+        MagicMock(message="The merged work had no corresponding Jira ticket."),
         MagicMock(message="Did the deployment produce a result worth reporting?"),
     ]
     blocks = build_draft_blocks(
@@ -199,6 +200,7 @@ def test_build_draft_blocks_hides_internal_collector_diagnostics() -> None:
 
     rendered = str(blocks)
     assert "lacked Jira links" not in rendered
+    assert "no corresponding Jira ticket" not in rendered
     assert "deployment produce a result" in rendered
 
 

@@ -7,6 +7,8 @@ from status.skills.drafter import (
     _empty_draft,
     _normalize_draft,
     build_repository_epic_hints,
+    compact_excessive_pr_outcomes,
+    draft_quality_issues,
     load_fixture,
     postprocess_draft,
     run_drafter,
@@ -257,3 +259,104 @@ def test_postprocess_omits_quiet_entry_without_current_evidence() -> None:
         result = postprocess_draft(draft, payload)
 
     assert result.entries == []
+
+
+def test_draft_quality_rejects_link_list_and_collector_language() -> None:
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-1",
+                epic_name="Pipeline",
+                state="shipped",
+                outcome=(
+                    "Merged [one](https://github.com/example/repo/pull/1), "
+                    "[two](https://github.com/example/repo/pull/2), and "
+                    "[three](https://github.com/example/repo/pull/3)."
+                ),
+                evidence=[
+                    "https://github.com/example/repo/pull/1",
+                    "https://github.com/example/repo/pull/2",
+                    "https://github.com/example/repo/pull/3",
+                ],
+                confidence="high",
+            )
+        ],
+        flags=["Three PRs have no linked Jira ticket."],
+    )
+
+    issues = draft_quality_issues(
+        draft,
+        {
+            "jira_issues": [
+                {
+                    "key": "EET-9",
+                    "is_assignee": False,
+                    "is_reporter": True,
+                }
+            ]
+        },
+    )
+
+    assert any("more than two GitHub links" in issue for issue in issues)
+    assert "flags expose internal Jira or collector diagnostics" in issues
+
+
+def test_draft_quality_rejects_reporter_only_jira_evidence() -> None:
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-1",
+                epic_name="Pipeline",
+                state="shipped",
+                outcome="The scheduling ticket reached Done.",
+                evidence=["EET-9"],
+                confidence="high",
+            )
+        ],
+    )
+
+    issues = draft_quality_issues(
+        draft,
+        {"jira_issues": [{"key": "EET-9", "is_assignee": False}]},
+    )
+
+    assert any("reporter-only Jira work" in issue for issue in issues)
+
+
+def test_compact_excessive_pr_outcomes_keeps_all_evidence() -> None:
+    urls = [f"https://github.com/example/repo/pull/{number}" for number in range(1, 4)]
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-1",
+                epic_name="Pipeline",
+                state="shipped",
+                outcome=" ".join(f"[PR]({url})" for url in urls),
+                evidence=urls,
+                confidence="high",
+            )
+        ],
+        flags=["Three PRs have no corresponding Jira ticket."],
+    )
+    payload = {
+        "pull_requests": [
+            {"url": url, "title": f"Change {number}", "state": "merged"}
+            for number, url in enumerate(urls, start=1)
+        ]
+    }
+
+    result = compact_excessive_pr_outcomes(draft, payload)
+
+    assert result.entries[0].outcome.count("https://github.com/") == 2
+    assert "1 related changes" in result.entries[0].outcome
+    assert result.entries[0].evidence == urls
+    assert result.flags == []
