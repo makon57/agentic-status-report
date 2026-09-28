@@ -12,9 +12,10 @@ from status.skills.evidence import markdown_links_to_slack
 ACTION_CONFIRM = "status_confirm"
 ACTION_EDIT = "status_edit"
 ACTION_REGENERATE = "status_regenerate"
+ACTION_PTO = "status_pto"
 
 # Slack allows at most 10 input blocks per modal view.
-EDIT_MODAL_MAX_TICKETED = 9  # reserve one input for missed/additional work
+EDIT_MODAL_MAX_ENTRIES = 9  # reserve one input for missed/additional work
 
 REGENERATE_REASON_LABELS: dict[str, str] = {
     "missed_work": "Draft missed important work",
@@ -31,6 +32,16 @@ STATE_LABELS: dict[str, str] = {
     "blocked": "Blocked",
     "quiet": "Quiet",
 }
+
+INTERNAL_FLAG_PHRASES = (
+    "lacked jira link",
+    "recorded only as reporter",
+    "status conflicted",
+    "current status in this payload",
+    "not inferred",
+    "supplied data",
+    "supplied history",
+)
 
 
 def _action_value(person_id: str, week_ending: date) -> str:
@@ -61,18 +72,26 @@ def format_entry_text(entry: StatusEntry) -> str:
 
 
 def build_flag_blocks(flags: list[Flag]) -> list[dict[str, Any]]:
-    blocks: list[dict[str, Any]] = []
-    for flag in flags[:5]:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f":warning: {flag.message}",
-                },
-            }
+    messages = list(
+        dict.fromkeys(
+            message
+            for flag in flags
+            if (message := flag.message.strip())
+            and not any(phrase in message.lower() for phrase in INTERNAL_FLAG_PHRASES)
         )
-    return blocks
+    )
+    if not messages:
+        return []
+    questions = "\n".join(f"• {message}" for message in messages[:3])
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*A few things to check*\n{questions}",
+            },
+        }
+    ]
 
 
 def build_draft_blocks(
@@ -83,10 +102,15 @@ def build_draft_blocks(
     entries: list[StatusEntry],
     flags: list[Flag],
     confirmed: bool = False,
+    on_leave: bool = False,
 ) -> list[dict[str, Any]]:
     week_label = week_ending.strftime("%b %d, %Y")
-    status_label = "Confirmed status" if confirmed else "Draft status"
-    review_hint = "Saved for this week." if confirmed else "Review each entry below."
+    if on_leave:
+        status_label = "PTO recorded"
+        review_hint = "No weekly update is expected."
+    else:
+        status_label = "Confirmed status" if confirmed else "Draft status"
+        review_hint = "Saved for this week." if confirmed else "Review each entry below."
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
@@ -100,6 +124,18 @@ def build_draft_blocks(
             },
         },
     ]
+
+    if on_leave:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":palm_tree: *On PTO* — reminders and this week's status are skipped.",
+                },
+            }
+        )
+        return blocks
 
     if not entries:
         blocks.append(
@@ -171,32 +207,39 @@ def build_draft_blocks(
                     "text": {"type": "plain_text", "text": "Regenerate"},
                     "value": value,
                 },
+                {
+                    "type": "button",
+                    "action_id": ACTION_PTO,
+                    "text": {"type": "plain_text", "text": "On PTO"},
+                    "value": value,
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Mark this week as PTO?"},
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                "This draft will be left out of the weekly report, "
+                                "and reminders will stop."
+                            ),
+                        },
+                        "confirm": {"type": "plain_text", "text": "Mark as PTO"},
+                        "deny": {"type": "plain_text", "text": "Cancel"},
+                    },
+                },
             ],
         }
     )
     return blocks
 
 
-def draft_fallback_text(display_name: str, week_ending: date, *, confirmed: bool = False) -> str:
-    prefix = "Confirmed" if confirmed else "Draft"
+def draft_fallback_text(
+    display_name: str,
+    week_ending: date,
+    *,
+    confirmed: bool = False,
+    on_leave: bool = False,
+) -> str:
+    prefix = "PTO" if on_leave else ("Confirmed" if confirmed else "Draft")
     return f"{prefix} status for {display_name}, week ending {week_ending.isoformat()}"
-
-
-def _unticketed_prefill(entries: list[StatusEntry], flags: list[Flag]) -> str:
-    for entry in entries:
-        if entry.epic_key is None:
-            return entry.outcome
-    for flag in flags:
-        if flag.flag_type == "unticketed":
-            return flag.message
-    return ""
-
-
-def _find_unticketed_entry(entries: list[StatusEntry]) -> StatusEntry | None:
-    for entry in entries:
-        if entry.epic_key is None:
-            return entry
-    return None
 
 
 def build_edit_modal(
@@ -211,13 +254,10 @@ def build_edit_modal(
 ) -> dict[str, Any]:
     """Build a Slack modal for editing draft status entries.
 
-    One input block per ticketed epic (blank outcome removes the entry).
+    One input block per generated entry (blank outcome removes the entry).
     Slack allows at most 10 input blocks per modal.
     """
-    ticketed = [entry for entry in entries if entry.epic_key is not None]
-    page_entries = ticketed[page_offset : page_offset + EDIT_MODAL_MAX_TICKETED]
-    unticketed_entry = _find_unticketed_entry(entries)
-    unticketed_initial = _unticketed_prefill(entries, flags)
+    page_entries = entries[page_offset : page_offset + EDIT_MODAL_MAX_ENTRIES]
 
     blocks: list[dict[str, Any]] = [
         {
@@ -260,8 +300,8 @@ def build_edit_modal(
             }
         )
 
-    if len(ticketed) > page_offset + len(page_entries):
-        remaining = len(ticketed) - page_offset - len(page_entries)
+    if len(entries) > page_offset + len(page_entries):
+        remaining = len(entries) - page_offset - len(page_entries)
         blocks.append(
             {
                 "type": "context",
@@ -283,7 +323,10 @@ def build_edit_modal(
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": f"_Editing entries {page_offset + 1}–{page_offset + len(page_entries)} of {len(ticketed)}._",
+                        "text": (
+                            f"_Editing entries {page_offset + 1}–"
+                            f"{page_offset + len(page_entries)} of {len(entries)}._"
+                        ),
                     }
                 ],
             }
@@ -298,9 +341,6 @@ def build_edit_modal(
             "text": "Meetings, side projects, epics not listed above — add Jira links if you have them",
         },
     }
-    if unticketed_initial:
-        unticketed_element["initial_value"] = unticketed_initial[:3000]
-
     blocks.append(
         {
             "type": "input",
@@ -325,10 +365,8 @@ def build_edit_modal(
                 "message_ts": message_ts,
                 "page_offset": page_offset,
                 "entry_ids": entry_ids,
-                "existing_unticketed_entry_id": (
-                    str(unticketed_entry.entry_id) if unticketed_entry is not None else None
-                ),
-                "total_ticketed": len(ticketed),
+                "existing_unticketed_entry_id": None,
+                "total_entries": len(entries),
             }
         ),
         "title": {"type": "plain_text", "text": "Edit Status"},

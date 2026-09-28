@@ -16,6 +16,7 @@ from status.db.confirm import (
     get_unacknowledged_flags,
     latest_confirmed_week,
     latest_unconfirmed_week,
+    mark_person_on_leave,
     record_regeneration,
 )
 from status.db.draft import get_current_drafts
@@ -25,6 +26,7 @@ from status.db.repo import get_person
 from status.slack.blocks import (
     ACTION_CONFIRM,
     ACTION_EDIT,
+    ACTION_PTO,
     ACTION_REGENERATE,
     REGENERATE_REASON_LABELS,
     build_draft_blocks,
@@ -138,13 +140,18 @@ def _update_message(
     display_name: str,
     week_ending: date,
     confirmed: bool,
+    on_leave: bool = False,
 ) -> None:
     with get_session() as session:
-        if confirmed:
+        if on_leave:
+            entries = []
+            flags = []
+        elif confirmed:
             entries = get_confirmed_entries_for_person(session, person_id, week_ending)
+            flags = get_unacknowledged_flags(session, person_id, week_ending)
         else:
             entries = get_current_drafts(session, person_id, week_ending)
-        flags = get_unacknowledged_flags(session, person_id, week_ending)
+            flags = get_unacknowledged_flags(session, person_id, week_ending)
         blocks = build_draft_blocks(
             person_id=person_id,
             display_name=display_name,
@@ -152,8 +159,14 @@ def _update_message(
             entries=entries,
             flags=flags,
             confirmed=confirmed,
+            on_leave=on_leave,
         )
-        fallback = draft_fallback_text(display_name, week_ending, confirmed=confirmed)
+        fallback = draft_fallback_text(
+            display_name,
+            week_ending,
+            confirmed=confirmed,
+            on_leave=on_leave,
+        )
 
     client.chat_update(
         channel=channel,
@@ -221,6 +234,62 @@ def register_handlers(app: Any, *, bot_token: str) -> None:
                     "Could not update the message, but your status may already be confirmed. "
                     "Try `/weekly-status` to see the confirmed view."
                 ),
+            )
+
+    @app.action(ACTION_PTO)
+    def on_pto(ack: Any, body: dict[str, Any], client: Any) -> None:
+        """Record PTO for the week and remove the draft from review."""
+        ack()
+        action = body["actions"][0]
+        person_id, week_ending = parse_action_value(action["value"])
+        slack_user_id = body["user"]["id"]
+        channel = body["channel"]["id"]
+        ts = body["message"]["ts"]
+
+        try:
+            with get_session() as session:
+                person = _authorize_person(session, person_id, slack_user_id)
+                if person is None:
+                    log.warning(
+                        "PTO rejected for unauthorized Slack user %s and person %s",
+                        slack_user_id,
+                        person_id,
+                    )
+                    client.chat_postEphemeral(
+                        channel=channel,
+                        user=slack_user_id,
+                        text="Could not record PTO — person record not found or not authorized.",
+                    )
+                    return
+                mark_person_on_leave(
+                    session,
+                    person_id,
+                    week_ending,
+                    marked_by=person.person_id,
+                )
+                display_name = person.display_name
+
+            _update_message(
+                client,
+                channel=channel,
+                ts=ts,
+                person_id=person_id,
+                display_name=display_name,
+                week_ending=week_ending,
+                confirmed=False,
+                on_leave=True,
+            )
+            client.chat_postEphemeral(
+                channel=channel,
+                user=slack_user_id,
+                text="PTO recorded — no reminder or status will be included this week.",
+            )
+        except Exception:
+            log.exception("PTO update failed for %s week %s", person_id, week_ending)
+            client.chat_postEphemeral(
+                channel=channel,
+                user=slack_user_id,
+                text="Could not record PTO. Try again or use `/weekly-status`.",
             )
 
     @app.action(ACTION_EDIT)

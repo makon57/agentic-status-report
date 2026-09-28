@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -23,6 +24,7 @@ from status.skills.evidence import (
     filter_evidence_to_payload,
     inject_markdown_links,
     issue_summary_index,
+    jira_keys_from_evidence,
     outcome_from_linked_evidence,
     payload_jira_keys,
 )
@@ -31,6 +33,10 @@ from status.skills.schemas import DraftEntry, DraftOutput
 from status.skills.skill_invoke import invoke_skill_json, skill_prompt_version, skill_provider
 
 log = logging.getLogger(__name__)
+
+GITHUB_REPO_URL_RE = re.compile(
+    r"https://github\.com/(?P<repo>[^/\s)]+/[^/\s)]+)(?:/(?:pull|commit)/|[\s)]|$)"
+)
 
 DRAFTER_INSTRUCTION = (
     "Use the weekly-status-drafter skill on the payload below. "
@@ -120,13 +126,88 @@ def attach_evidence_labels(draft: DraftOutput, payload: dict[str, Any]) -> Draft
     return draft.model_copy(update={"entries": enriched})
 
 
+def _github_repo_from_text(value: object) -> str | None:
+    match = GITHUB_REPO_URL_RE.search(str(value or ""))
+    return match.group("repo") if match else None
+
+
+def build_repository_epic_hints(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Build unambiguous repository-to-epic context from grounded evidence."""
+    candidates: dict[str, dict[str, dict[str, str]]] = {}
+
+    def add_hint(
+        repo: str | None,
+        *,
+        epic_key: object,
+        epic_name: object,
+        project: object,
+        basis: str,
+    ) -> None:
+        key = str(epic_key or "").strip()
+        if not repo or not key:
+            return
+        candidates.setdefault(repo, {})[key] = {
+            "repo": repo,
+            "epic_key": key,
+            "epic_name": str(epic_name or "").strip(),
+            "project": str(project or "").strip(),
+            "basis": basis,
+        }
+
+    issues = {
+        str(issue.get("key")): issue
+        for issue in payload.get("jira_issues") or []
+        if issue.get("key")
+    }
+    for artifact in [
+        *(payload.get("pull_requests") or []),
+        *(payload.get("commits") or []),
+    ]:
+        repo = str(artifact.get("repo") or "").strip() or _github_repo_from_text(
+            artifact.get("url")
+        )
+        for issue_key in artifact.get("linked_issue_keys") or []:
+            issue = issues.get(str(issue_key))
+            if issue:
+                add_hint(
+                    repo,
+                    epic_key=issue.get("epic_key"),
+                    epic_name=issue.get("epic_name"),
+                    project=issue.get("project"),
+                    basis="current linked Jira evidence",
+                )
+
+    for previous in payload.get("previous_entries") or []:
+        values = [previous.get("outcome"), *(previous.get("evidence") or [])]
+        for value in values:
+            add_hint(
+                _github_repo_from_text(value),
+                epic_key=previous.get("epic_key"),
+                epic_name=previous.get("epic_name"),
+                project=previous.get("project"),
+                basis="recent confirmed evidence",
+            )
+
+    return [
+        next(iter(epics.values()))
+        for _repo, epics in sorted(candidates.items())
+        if len(epics) == 1
+    ]
+
+
 def _pr_outcome(pull_requests: list[dict[str, Any]]) -> str:
     """Build a concise, fully grounded outcome for repository-only PR work."""
     merged = [pr for pr in pull_requests if pr.get("state") == "merged"]
     ongoing = [pr for pr in pull_requests if pr.get("state") != "merged"]
 
     def links(rows: list[dict[str, Any]]) -> str:
-        values = [f"[{str(row.get('title') or 'pull request').strip()}]({row['url']})" for row in rows]
+        visible = rows[:2]
+        values = [
+            f"[{str(row.get('title') or 'pull request').strip()}]({row['url']})"
+            for row in visible
+        ]
+        if len(rows) > len(visible):
+            values.append(f"{len(rows) - len(visible)} related changes")
         if len(values) == 1:
             return values[0]
         return f"{', '.join(values[:-1])}, and {values[-1]}"
@@ -137,6 +218,129 @@ def _pr_outcome(pull_requests: list[dict[str, Any]]) -> str:
     if ongoing:
         clauses.append(f"Working on {links(ongoing)}")
     return ". ".join(clauses) + "."
+
+
+def _entry_repository(entry: DraftEntry) -> str | None:
+    repos = {
+        repo
+        for value in [entry.outcome, *entry.evidence]
+        if (repo := _github_repo_from_text(value))
+    }
+    if not repos and "/" in entry.project:
+        repos.add(entry.project)
+    return next(iter(repos)) if len(repos) == 1 else None
+
+
+def merge_hinted_repository_entries(
+    draft: DraftOutput,
+    payload: dict[str, Any],
+) -> DraftOutput:
+    """Fold model-created repository rows into an unambiguous hinted epic."""
+    hints = {
+        str(hint["repo"]): hint
+        for hint in payload.get("repository_epic_hints") or []
+        if hint.get("repo") and hint.get("epic_key")
+    }
+    if not hints:
+        return draft
+
+    issues = {
+        str(issue.get("key")): issue
+        for issue in payload.get("jira_issues") or []
+        if issue.get("key")
+    }
+    pull_requests_by_repo: dict[str, list[dict[str, Any]]] = {}
+    for pull_request in payload.get("pull_requests") or []:
+        repo = str(pull_request.get("repo") or "").strip()
+        if repo:
+            pull_requests_by_repo.setdefault(repo, []).append(pull_request)
+
+    entries = list(draft.entries)
+    remove_indexes: set[int] = set()
+    for source_index, source in enumerate(entries):
+        if source.epic_key is not None:
+            continue
+        repo = _entry_repository(source)
+        hint = hints.get(repo or "")
+        if not repo or hint is None:
+            continue
+
+        pull_requests = pull_requests_by_repo.get(repo, [])
+        source_outcome = (
+            _pr_outcome(pull_requests)
+            if len(pull_requests) > 2
+            else source.outcome
+        )
+        target_index = next(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if index not in remove_indexes
+                and entry.epic_key == str(hint["epic_key"])
+            ),
+            None,
+        )
+        mapping_only_question = bool(
+            source.why_flagged
+            and re.search(r"initiative|unticketed|epic", source.why_flagged, re.IGNORECASE)
+        )
+        source_updates: dict[str, Any] = {
+            "project": str(hint.get("project") or source.project),
+            "epic_key": str(hint["epic_key"]),
+            "epic_name": str(hint.get("epic_name") or "") or None,
+            "outcome": source_outcome,
+        }
+        if mapping_only_question:
+            source_updates.update({"needs_human": False, "why_flagged": None})
+        mapped_source = source.model_copy(update=source_updates)
+
+        if target_index is None:
+            entries[source_index] = mapped_source
+            continue
+
+        target = entries[target_index]
+        owned_jira_keys = {
+            key
+            for key in jira_keys_from_evidence(target.evidence)
+            if issues.get(key, {}).get("is_assignee") is True
+        }
+        if owned_jira_keys:
+            outcome = f"{target.outcome.rstrip()} {source_outcome}"
+            evidence = list(dict.fromkeys([*target.evidence, *mapped_source.evidence]))
+            evidence_labels = {
+                **target.evidence_labels,
+                **mapped_source.evidence_labels,
+            }
+            state = (
+                "progressing"
+                if "progressing" in {target.state, mapped_source.state}
+                else mapped_source.state
+            )
+            needs_human = target.needs_human or mapped_source.needs_human
+            why_flagged = target.why_flagged or mapped_source.why_flagged
+        else:
+            outcome = mapped_source.outcome
+            evidence = list(mapped_source.evidence)
+            evidence_labels = dict(mapped_source.evidence_labels)
+            state = mapped_source.state
+            needs_human = mapped_source.needs_human
+            why_flagged = mapped_source.why_flagged
+
+        entries[target_index] = target.model_copy(
+            update={
+                "outcome": outcome,
+                "evidence": evidence,
+                "evidence_labels": evidence_labels,
+                "state": state,
+                "confidence": mapped_source.confidence,
+                "needs_human": needs_human,
+                "why_flagged": why_flagged,
+            }
+        )
+        remove_indexes.add(source_index)
+
+    merged = [entry for index, entry in enumerate(entries) if index not in remove_indexes]
+    return draft.model_copy(update={"entries": merged})
 
 
 def ensure_pr_only_entries(draft: DraftOutput, payload: dict[str, Any]) -> DraftOutput:
@@ -155,7 +359,31 @@ def ensure_pr_only_entries(draft: DraftOutput, payload: dict[str, Any]) -> Draft
 
     entries = list(draft.entries)
     flags = list(draft.flags)
+    hints = {
+        str(hint["repo"]): str(hint["epic_key"])
+        for hint in payload.get("repository_epic_hints") or []
+        if hint.get("repo") and hint.get("epic_key")
+    }
     for repo, pull_requests in by_repo.items():
+        hinted_epic = hints.get(repo)
+        matching_index = next(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if hinted_epic and entry.epic_key == hinted_epic
+            ),
+            None,
+        )
+        if matching_index is not None:
+            entry = entries[matching_index]
+            evidence = list(
+                dict.fromkeys(
+                    [*entry.evidence, *(str(pr["url"]) for pr in pull_requests)]
+                )
+            )
+            entries[matching_index] = entry.model_copy(update={"evidence": evidence})
+            continue
+
         entries.append(
             DraftEntry(
                 project=repo,
@@ -221,9 +449,15 @@ def postprocess_draft(draft: DraftOutput, payload: dict[str, Any]) -> DraftOutpu
                     "collector data; previous entries are context only. Is any removed work "
                     "actually current?"
                 )
-        processed.append(entry.model_copy(update=updates))
+        processed_entry = entry.model_copy(update=updates)
+        if processed_entry.state == "quiet" and not processed_entry.evidence:
+            continue
+        processed.append(processed_entry)
 
-    processed_draft = draft.model_copy(update={"entries": processed})
+    processed_draft = merge_hinted_repository_entries(
+        draft.model_copy(update={"entries": processed}),
+        payload,
+    )
     return ensure_pr_only_entries(processed_draft, payload)
 
 
@@ -241,6 +475,11 @@ def run_drafter(payload: dict[str, Any], *, dry_run: bool = False) -> DraftOutpu
     elif not settings.anthropic_api_key:
         return _empty_draft(payload, flags=["ANTHROPIC_API_KEY not configured"])
 
+    skill_payload = dict(payload)
+    repository_epic_hints = build_repository_epic_hints(payload)
+    if repository_epic_hints:
+        skill_payload["repository_epic_hints"] = repository_epic_hints
+
     instruction = DRAFTER_INSTRUCTION
     regeneration_notes = str(payload.get("regeneration_notes") or "").strip()
     if regeneration_notes:
@@ -255,7 +494,7 @@ def run_drafter(payload: dict[str, Any], *, dry_run: bool = False) -> DraftOutpu
             result = invoke_skill_json(
                 skill_id=settings.drafter_skill_id,
                 skill_version=settings.drafter_skill_version,
-                payload=payload,
+                payload=skill_payload,
                 instruction=instruction,
                 schema=DraftOutput,
                 settings=settings,
@@ -263,7 +502,7 @@ def run_drafter(payload: dict[str, Any], *, dry_run: bool = False) -> DraftOutpu
             assert isinstance(result, DraftOutput)
             normalized = _normalize_draft(result, payload)
             labeled = attach_evidence_labels(normalized, payload)
-            return postprocess_draft(labeled, payload)
+            return postprocess_draft(labeled, skill_payload)
         except (SkillError, OpenAISkillError) as exc:
             last_error = exc
             log.warning("drafter attempt %s failed: %s", attempt + 1, exc)

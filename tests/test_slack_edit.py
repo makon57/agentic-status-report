@@ -7,7 +7,7 @@ from uuid import uuid4
 from status.db.edit import persist_edited_entries
 from status.db.models import EntrySource, Flag, StatusEntry
 from status.slack.blocks import (
-    EDIT_MODAL_MAX_TICKETED,
+    EDIT_MODAL_MAX_ENTRIES,
     build_edit_modal,
     parse_edit_submission_values,
 )
@@ -36,7 +36,7 @@ def _entry(
 
 
 def test_build_edit_modal_respects_slack_input_block_limit() -> None:
-    entries = [_entry(epic_key=f"EET-{idx}") for idx in range(EDIT_MODAL_MAX_TICKETED + 4)]
+    entries = [_entry(epic_key=f"EET-{idx}") for idx in range(EDIT_MODAL_MAX_ENTRIES + 4)]
     modal = build_edit_modal(
         person_id="pilot",
         week_ending=date(2026, 8, 14),
@@ -47,10 +47,10 @@ def test_build_edit_modal_respects_slack_input_block_limit() -> None:
     )
     input_blocks = [block for block in modal["blocks"] if block["type"] == "input"]
     assert len(input_blocks) <= 10
-    assert len(input_blocks) == EDIT_MODAL_MAX_TICKETED + 1
+    assert len(input_blocks) == EDIT_MODAL_MAX_ENTRIES + 1
 
 
-def test_build_edit_modal_prefills_unticketed_from_flag() -> None:
+def test_build_edit_modal_does_not_prefill_additional_work_from_flag() -> None:
     flag = Flag(
         flag_id=uuid4(),
         week_ending=date(2026, 8, 14),
@@ -70,7 +70,33 @@ def test_build_edit_modal_prefills_unticketed_from_flag() -> None:
     unticketed_block = next(
         block for block in modal["blocks"] if block.get("block_id") == "unticketed_work"
     )
-    assert unticketed_block["element"]["initial_value"] == "Meetings and design reviews."
+    assert "initial_value" not in unticketed_block["element"]
+
+
+def test_build_edit_modal_keeps_generated_unticketed_entry_editable() -> None:
+    unticketed_entry = _entry(
+        epic_key=None,
+        outcome="Merged repository automation improvements.",
+    )
+    modal = build_edit_modal(
+        person_id="pilot",
+        week_ending=date(2026, 8, 14),
+        entries=[unticketed_entry],
+        flags=[],
+        channel="C123",
+        message_ts="1234.5678",
+    )
+
+    entry_block = next(
+        block
+        for block in modal["blocks"]
+        if block.get("block_id") == f"entry_{unticketed_entry.entry_id}"
+    )
+    additional_block = next(
+        block for block in modal["blocks"] if block.get("block_id") == "unticketed_work"
+    )
+    assert entry_block["element"]["initial_value"] == unticketed_entry.outcome
+    assert "initial_value" not in additional_block["element"]
 
 
 def test_parse_edit_submission_values_treats_cleared_field_as_drop() -> None:
