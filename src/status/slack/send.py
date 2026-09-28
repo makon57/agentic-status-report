@@ -13,6 +13,7 @@ from status.db.confirm import (
     record_draft_sent,
 )
 from status.db.draft import get_current_drafts
+from status.db.models import Participation
 from status.db.repo import get_person
 from status.slack.blocks import build_draft_blocks, draft_fallback_text
 
@@ -60,11 +61,22 @@ def send_status_review(
         if not person.slack_user_id:
             raise SlackSendError(f"person {person_id} has no slack_user_id")
 
-        if confirmed:
+        participation = session.get(Participation, (person.person_id, week_ending))
+        on_leave = bool(
+            not confirmed
+            and participation is not None
+            and participation.status == "on_leave"
+        )
+
+        if on_leave:
+            entries = []
+            flags = []
+        elif confirmed:
             entries = get_confirmed_entries_for_person(session, person.person_id, week_ending)
+            flags = get_unacknowledged_flags(session, person.person_id, week_ending)
         else:
             entries = get_current_drafts(session, person.person_id, week_ending)
-        flags = get_unacknowledged_flags(session, person.person_id, week_ending)
+            flags = get_unacknowledged_flags(session, person.person_id, week_ending)
         blocks = build_draft_blocks(
             person_id=person.person_id,
             display_name=person.display_name,
@@ -72,14 +84,16 @@ def send_status_review(
             entries=entries,
             flags=flags,
             confirmed=confirmed,
+            on_leave=on_leave,
         )
         fallback = draft_fallback_text(
             person.display_name,
             week_ending,
             confirmed=confirmed,
+            on_leave=on_leave,
         )
         slack_user_id = person.slack_user_id
-        if not confirmed:
+        if not confirmed and not on_leave:
             record_draft_sent(session, person.person_id, week_ending)
 
     channel_id = open_dm_channel(client, slack_user_id)

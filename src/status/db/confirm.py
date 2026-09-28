@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -66,7 +66,7 @@ def record_regeneration(
     notes: str | None = None,
 ) -> Participation:
     """Record that the user regenerated their draft for this week."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     row = session.get(Participation, (person_id, week_ending))
     if row is None:
         row = Participation(
@@ -89,7 +89,7 @@ def record_regeneration(
 
 
 def record_draft_sent(session: Session, person_id: str, week_ending: date) -> Participation:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     row = session.get(Participation, (person_id, week_ending))
     if row is None:
         row = Participation(
@@ -100,8 +100,36 @@ def record_draft_sent(session: Session, person_id: str, week_ending: date) -> Pa
         )
         session.add(row)
     else:
+        if row.status == "on_leave":
+            return row
         row.status = "sent"
         row.draft_sent_at = now
+    session.flush()
+    return row
+
+
+def mark_person_on_leave(
+    session: Session,
+    person_id: str,
+    week_ending: date,
+    *,
+    marked_by: str,
+) -> Participation:
+    """Record an authenticated PTO response and suppress reminders for the week."""
+    now = datetime.now(UTC)
+    row = session.get(Participation, (person_id, week_ending))
+    if row is None:
+        row = Participation(
+            person_id=person_id,
+            week_ending=week_ending,
+            status="on_leave",
+        )
+        session.add(row)
+    else:
+        row.status = "on_leave"
+
+    row.confirmed_at = now
+    row.note = f"PTO recorded by {marked_by}"
     session.flush()
     return row
 
@@ -114,7 +142,7 @@ def confirm_draft_entries(
     confirmed_by: str,
 ) -> list[StatusEntry]:
     """Mark all unconfirmed current drafts as confirmed for this person/week."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     entries = get_current_drafts(session, person_id, week_ending)
     if not entries:
         return []

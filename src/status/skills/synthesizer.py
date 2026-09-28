@@ -57,6 +57,15 @@ RAW_PR_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 NOTES_SECTION_RE = re.compile(r"\n## Notes\s*\n.*\Z", re.DOTALL)
+GENERIC_EVIDENCE_SUFFIX_RE = re.compile(
+    r";\s*see\s+(?:(?:implementation\s+)?change)"
+    r"(?:(?:,\s*(?:and\s+)?|\s+and\s+)(?:(?:implementation\s+)?change))*\.??",
+    re.IGNORECASE,
+)
+SUPPORTING_PRS_SUFFIX_RE = re.compile(
+    r";\s*supporting\s+PRs?\s*:[^.\n]*\.??",
+    re.IGNORECASE,
+)
 GAP_COMMENTARY_RES = [
     re.compile(r";\s*this work has no linked Jira tickets despite[^.;]*\.?", re.IGNORECASE),
     re.compile(r";\s*no linked commits or PRs were found this week\.?", re.IGNORECASE),
@@ -194,6 +203,29 @@ def restore_markdown_structure(text: str) -> str:
     return cleaned.lstrip("\n")
 
 
+def enforce_authoritative_report_labels(
+    markdown: str,
+    payload: SynthesisInput,
+) -> str:
+    """Restore deterministic section labels when a section has one known initiative."""
+    names_by_category: dict[str, set[str]] = defaultdict(set)
+    for entry in payload.entries:
+        names_by_category[entry.report_category].add(entry.report_name)
+
+    category: str | None = None
+    lines: list[str] = []
+    bullet_re = re.compile(r"^(\s*\*\s+\*\*)([^*]+)(\*\*\s+-\s+.*)$")
+    for line in markdown.splitlines():
+        if line.startswith("## "):
+            category = line[3:].strip()
+        match = bullet_re.match(line)
+        allowed = names_by_category.get(category or "", set())
+        if match and len(allowed) == 1 and match.group(2).strip() not in allowed:
+            line = f"{match.group(1)}{next(iter(allowed))}{match.group(3)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def sanitize_report_markdown(markdown: str, payload: SynthesisInput | None = None) -> str:
     """Repair common synthesizer markdown issues to match format-status rules."""
     jira_phrases = build_jira_link_phrases(payload) if payload else {}
@@ -223,10 +255,15 @@ def sanitize_report_markdown(markdown: str, payload: SynthesisInput | None = Non
         cleaned,
     )
     cleaned = limit_visible_github_links(cleaned)
+    cleaned = GENERIC_EVIDENCE_SUFFIX_RE.sub("", cleaned)
+    cleaned = SUPPORTING_PRS_SUFFIX_RE.sub("", cleaned)
     cleaned = EMPTY_MARKDOWN_LINK_RE.sub(r"\1", cleaned)
     cleaned = NOTES_SECTION_RE.sub("", cleaned)
     cleaned = strip_gap_commentary(cleaned)
     cleaned = restore_markdown_structure(cleaned)
+    if payload:
+        cleaned = enforce_authoritative_report_labels(cleaned, payload)
+    cleaned = re.sub(r"^(## [^\n]+)\n(?!\n)", r"\1\n\n", cleaned, flags=re.MULTILINE)
     cleaned = _collapse_punctuation(cleaned)
     return cleaned.strip() + "\n"
 

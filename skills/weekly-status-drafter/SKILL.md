@@ -21,7 +21,7 @@ You receive a JSON payload:
 
 ```json
 {
-  "person": "string, Jira account id or handle",
+  "person": "stable ledger person id",
   "week_start": "YYYY-MM-DD",
   "week_end": "YYYY-MM-DD",
   "jira_issues": [
@@ -54,6 +54,15 @@ You receive a JSON payload:
       "message": "string", "repo": "owner/repo", "committed_at": "ISO-8601",
       "linked_issue_keys": ["AIPLAT-231"] }
   ],
+  "repository_epic_hints": [
+    {
+      "repo": "owner/repository",
+      "epic_key": "AIPLAT-204",
+      "epic_name": "string",
+      "project": "AIPLAT",
+      "basis": "current linked Jira evidence | recent confirmed evidence"
+    }
+  ],
   "previous_entries": [ "last 3 weeks of confirmed entries, same schema as output" ]
 }
 ```
@@ -79,14 +88,31 @@ Tickets with no epic go into a single entry per project, with
 `epic_key: null` and `needs_human: true` — the human usually knows which
 initiative it belonged to and can say so in one word.
 
-Pull requests without a linked Jira ticket are still reportable work. Group
-them into one entry per repository, set `epic_key` and `epic_name` to `null`,
-and set `needs_human: true`. Use the repository as `project`, cite every PR URL
-that supports the entry, and ask which initiative the work belongs to. A merged
-PR is shipped evidence; an open or draft PR is progressing evidence. When a
-repository has both, use `progressing` and describe the merged and ongoing work
-separately. Do not return an empty `entries` array when this week's payload has
-attributable PR activity.
+Pull requests without a linked Jira ticket are still reportable work. Before
+creating an unticketed repository entry, consult `repository_epic_hints`. These
+hints are built from linked Jira keys and recent confirmed evidence and apply to
+any repository or Jira project; they are not a hard-coded project map.
+
+- When a hint and the PR titles clearly describe the same initiative, combine
+  the Jira and GitHub work into one epic entry. Jira does not need to have been
+  updated that week for the PRs to support progress on the initiative.
+- When there is no repository hint, compare the PR titles and commit messages
+  with current Jira summaries, descriptions, and epic names. If they clearly
+  describe one initiative, use that epic for the repository work instead of
+  creating a second unticketed entry.
+- A Jira issue owned by someone else may supply structural context such as its
+  parent epic for the person's attributable GitHub work. Do not cite that issue,
+  claim its status as the person's work, or describe its assignee's progress.
+- A repository can serve multiple initiatives. Treat a hint as context, not
+  permission to attach clearly unrelated work to an epic.
+- If no hint fits, group unlinked PRs into one entry per repository, set
+  `epic_key` and `epic_name` to `null`, and ask the reviewer which initiative
+  owns the work.
+
+A merged PR is shipped evidence; an open or draft PR is progressing evidence.
+When a repository has both, use `progressing` and describe the merged and
+ongoing work separately. Do not return an empty `entries` array when this
+week's payload has attributable PR activity.
 
 ## Ownership
 
@@ -114,12 +140,21 @@ links** for Jira tickets and PRs:
 
 Rules:
 
+- Write for the engineer reviewing their status, not for someone debugging the
+  collector. State what happened in direct, natural language.
+- Do not put audit mechanics in `outcome`: avoid phrases such as "listed as",
+  "supplied data", "transition history established", "recorded only as
+  reporter", or "conflicted with the description". Put genuine uncertainty in
+  a short `why_flagged` question instead.
 - Preserve concrete technical nouns, components, observed behavior, decisions,
   and remaining state from ticket descriptions and comments. Do not reduce a
   specific problem to "worked on integration issues" or "advanced discussions."
 - Describe what the work did; do not use merge counts or a list of PR numbers as
   the outcome. PR URLs remain evidence even when the sentence summarizes their
   combined purpose.
+- Put every supporting PR URL in `evidence`, but do not hyperlink every PR in
+  `outcome`. Prefer the initiative or Jira subject link and at most one or two
+  representative artifact links when they materially help the reader.
 - When ticket summaries are generic or duplicated, use `description` and this
   week's `comments` to identify the concrete subject, decision, completed work,
   and remaining work. Link text must name that subject; never write placeholders
@@ -178,9 +213,10 @@ Assign exactly one:
 - `blocked` — a comment or status explicitly names an external dependency
 - `quiet` — no activity at all this week
 
-`quiet` epics get **one line and nothing else**. Do not manufacture narrative for
-a week where nothing happened; a manager reading "continued to monitor and
-support ongoing efforts" learns nothing and trusts the next line less.
+Omit `quiet` epics from the draft when there is no current-week evidence. Do not
+carry a prior-week initiative forward merely to say that nothing happened. If a
+long silence genuinely needs the reviewer's attention, use one concise flag
+instead of a status entry.
 
 ## Evidence and confidence
 
@@ -206,13 +242,18 @@ This is the part a form can never do. After building entries, scan across
 - an epic that appeared in previous weeks and has now been silent 3+ weeks
 - a ticket in progress substantially longer than similar tickets historically
 - an epic accumulating new tickets faster than it closes them
-- work in this week's PRs with no corresponding Jira ticket
+- work in this week's PRs that cannot be confidently connected to a Jira
+  initiative
 
-An unticketed-PR flag supplements its repository entry; it does not replace the
+Do not flag a PR merely because its title or branch omits a Jira key when its
+repository history and subject clearly connect it to an initiative. An
+unmapped-PR flag supplements its repository entry; it does not replace the
 entry.
 
 Flags are observations for the human, not accusations. Write them plainly:
 `AIPLAT-190 has had no activity for 3 weeks.` Not: `AIPLAT-190 appears to be at risk.`
+Only emit a flag when the reviewer can take a clear action. Prefer one direct
+question over technical diagnostics or a list of every inconsistency observed.
 
 ## Unticketed work
 

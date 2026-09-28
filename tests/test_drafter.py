@@ -6,7 +6,11 @@ from unittest.mock import patch
 from status.skills.drafter import (
     _empty_draft,
     _normalize_draft,
+    build_repository_epic_hints,
+    compact_excessive_pr_outcomes,
+    draft_quality_issues,
     load_fixture,
+    postprocess_draft,
     run_drafter,
     week_ending_from_payload,
 )
@@ -104,3 +108,255 @@ def test_load_fixture(tmp_path) -> None:
     path = tmp_path / "payload.json"
     path.write_text('{"person": "pilot", "week_end": "2026-08-14"}')
     assert load_fixture(path)["person"] == "pilot"
+
+
+def test_repository_epic_hints_use_confirmed_repository_evidence() -> None:
+    payload = {
+        "previous_entries": [
+            {
+                "project": "EET",
+                "epic_key": "EET-5519",
+                "epic_name": "Agentic Weekly Status Pipeline",
+                "outcome": "Improved weekly status automation.",
+                "evidence": [
+                    "https://github.com/opdev/agentic-status-report/pull/17"
+                ],
+            }
+        ]
+    }
+
+    assert build_repository_epic_hints(payload) == [
+        {
+            "repo": "opdev/agentic-status-report",
+            "epic_key": "EET-5519",
+            "epic_name": "Agentic Weekly Status Pipeline",
+            "project": "EET",
+            "basis": "recent confirmed evidence",
+        }
+    ]
+
+
+def test_repository_epic_hints_drop_ambiguous_repository() -> None:
+    payload = {
+        "previous_entries": [
+            {
+                "project": "EET",
+                "epic_key": epic_key,
+                "epic_name": epic_key,
+                "outcome": f"[{epic_key} work](https://github.com/example/shared/pull/{number})",
+                "evidence": [],
+            }
+            for epic_key, number in [("EET-1", 1), ("EET-2", 2)]
+        ]
+    }
+
+    assert build_repository_epic_hints(payload) == []
+
+
+def test_postprocess_merges_separate_repo_work_into_hinted_epic() -> None:
+    pr_url = "https://github.com/opdev/agentic-status-report/pull/40"
+    payload = {
+        "person": "pilot",
+        "week_end": "2026-08-14",
+        "jira_issues": [
+            {
+                "key": "EET-5529",
+                "summary": "OpenShift CronJobs and weekly automation",
+                "epic_key": "EET-5519",
+                "epic_name": "Agentic Weekly Status Pipeline",
+                "project": "EET",
+                "is_assignee": False,
+                "is_reporter": True,
+            }
+        ],
+        "commits": [],
+        "pull_requests": [
+            {
+                "repo": "opdev/agentic-status-report",
+                "url": pr_url,
+                "title": "Makefile operations",
+                "state": "merged",
+                "linked_issue_keys": [],
+            }
+        ],
+        "repository_epic_hints": [
+            {
+                "repo": "opdev/agentic-status-report",
+                "epic_key": "EET-5519",
+            }
+        ],
+    }
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-5519",
+                epic_name="Agentic Weekly Status Pipeline",
+                state="progressing",
+                outcome="The Jira item was listed as Done without transition history.",
+                evidence=["EET-5529"],
+                confidence="low",
+                needs_human=True,
+                why_flagged="Was this reporter-only ticket completed?",
+            ),
+            DraftEntry(
+                project="opdev/agentic-status-report",
+                epic_key=None,
+                epic_name=None,
+                state="shipped",
+                outcome="Merged Makefile operations for local and cluster workflows.",
+                evidence=[pr_url],
+                confidence="high",
+                needs_human=True,
+                why_flagged="Which initiative owns this unticketed work?",
+            ),
+        ],
+    )
+
+    with patch("status.skills.drafter.get_settings") as settings_mock:
+        settings_mock.return_value.jira_base_url = "https://redhat.atlassian.net"
+        result = postprocess_draft(draft, payload)
+
+    assert len(result.entries) == 1
+    assert result.entries[0].epic_key == "EET-5519"
+    assert result.entries[0].evidence == [pr_url]
+    assert result.entries[0].outcome == (
+        "Merged Makefile operations for local and cluster workflows."
+    )
+    assert result.entries[0].state == "shipped"
+    assert result.entries[0].needs_human is False
+    assert result.flags == []
+
+
+def test_postprocess_omits_quiet_entry_without_current_evidence() -> None:
+    payload = {
+        "person": "pilot",
+        "week_end": "2026-08-14",
+        "jira_issues": [],
+        "pull_requests": [],
+        "commits": [],
+    }
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-5506",
+                epic_name="Partner certification",
+                state="quiet",
+                outcome="No activity was recorded this week.",
+                evidence=["EET-5506"],
+                confidence="low",
+            )
+        ],
+    )
+
+    with patch("status.skills.drafter.get_settings") as settings_mock:
+        settings_mock.return_value.jira_base_url = "https://redhat.atlassian.net"
+        result = postprocess_draft(draft, payload)
+
+    assert result.entries == []
+
+
+def test_draft_quality_rejects_link_list_and_collector_language() -> None:
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-1",
+                epic_name="Pipeline",
+                state="shipped",
+                outcome=(
+                    "Merged [one](https://github.com/example/repo/pull/1), "
+                    "[two](https://github.com/example/repo/pull/2), and "
+                    "[three](https://github.com/example/repo/pull/3)."
+                ),
+                evidence=[
+                    "https://github.com/example/repo/pull/1",
+                    "https://github.com/example/repo/pull/2",
+                    "https://github.com/example/repo/pull/3",
+                ],
+                confidence="high",
+            )
+        ],
+        flags=["Three PRs have no linked Jira ticket."],
+    )
+
+    issues = draft_quality_issues(
+        draft,
+        {
+            "jira_issues": [
+                {
+                    "key": "EET-9",
+                    "is_assignee": False,
+                    "is_reporter": True,
+                }
+            ]
+        },
+    )
+
+    assert any("more than two GitHub links" in issue for issue in issues)
+    assert "flags expose internal Jira or collector diagnostics" in issues
+
+
+def test_draft_quality_rejects_reporter_only_jira_evidence() -> None:
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-1",
+                epic_name="Pipeline",
+                state="shipped",
+                outcome="The scheduling ticket reached Done.",
+                evidence=["EET-9"],
+                confidence="high",
+            )
+        ],
+    )
+
+    issues = draft_quality_issues(
+        draft,
+        {"jira_issues": [{"key": "EET-9", "is_assignee": False}]},
+    )
+
+    assert any("reporter-only Jira work" in issue for issue in issues)
+
+
+def test_compact_excessive_pr_outcomes_keeps_all_evidence() -> None:
+    urls = [f"https://github.com/example/repo/pull/{number}" for number in range(1, 4)]
+    draft = DraftOutput(
+        person="pilot",
+        week_ending="2026-08-14",
+        entries=[
+            DraftEntry(
+                project="EET",
+                epic_key="EET-1",
+                epic_name="Pipeline",
+                state="shipped",
+                outcome=" ".join(f"[PR]({url})" for url in urls),
+                evidence=urls,
+                confidence="high",
+            )
+        ],
+        flags=["Three PRs have no corresponding Jira ticket."],
+    )
+    payload = {
+        "pull_requests": [
+            {"url": url, "title": f"Change {number}", "state": "merged"}
+            for number, url in enumerate(urls, start=1)
+        ]
+    }
+
+    result = compact_excessive_pr_outcomes(draft, payload)
+
+    assert result.entries[0].outcome.count("https://github.com/") == 2
+    assert "1 related changes" in result.entries[0].outcome
+    assert result.entries[0].evidence == urls
+    assert result.flags == []
