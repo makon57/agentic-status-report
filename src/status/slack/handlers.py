@@ -20,8 +20,8 @@ from status.db.confirm import (
 )
 from status.db.draft import get_current_drafts
 from status.db.edit import EditValidationError, persist_edited_entries
-from status.db.repo import get_person
 from status.db.models import Person
+from status.db.repo import get_person
 from status.slack.blocks import (
     ACTION_CONFIRM,
     ACTION_EDIT,
@@ -42,7 +42,7 @@ def _authorize_person(session: Any, person_id: str, slack_user_id: str) -> Perso
     person = get_person(session, person_id)
     if person is None:
         return None
-    if person.slack_user_id and person.slack_user_id != slack_user_id:
+    if not person.slack_user_id or person.slack_user_id != slack_user_id:
         return None
     return person
 
@@ -177,13 +177,17 @@ def register_handlers(app: Any, *, bot_token: str) -> None:
 
         try:
             with get_session() as session:
-                person = get_person(session, person_id)
+                person = _authorize_person(session, person_id, slack_user_id)
                 if person is None:
-                    log.warning("confirm for unknown person %s", person_id)
+                    log.warning(
+                        "confirm rejected for unauthorized Slack user %s and person %s",
+                        slack_user_id,
+                        person_id,
+                    )
                     client.chat_postEphemeral(
                         channel=channel,
                         user=slack_user_id,
-                        text="Could not confirm — person record not found.",
+                        text="Could not confirm — person record not found or not authorized.",
                     )
                     return
                 confirm_draft_entries(
