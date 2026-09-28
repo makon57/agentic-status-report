@@ -300,6 +300,39 @@ def test_management_quality_issues_rejects_ordinal_placeholders() -> None:
     ]
 
 
+def test_sanitize_report_restores_authoritative_name_and_drops_evidence_checklist() -> None:
+    payload = SynthesisInput(
+        week_ending="2026-09-25",
+        entries=[
+            SynthesisEntry(
+                person_id="yoza",
+                display_name="Yash Oza",
+                project="EET",
+                epic_key="EET-5519",
+                epic_name="Agentic Weekly Status Pipeline",
+                state="progressing",
+                outcome="Improved the weekly status pipeline.",
+                evidence=["https://github.com/opdev/agentic-status-report/pull/29"],
+                report_category="Partner Enablement",
+                report_name="Partner Labs",
+            )
+        ],
+    )
+    raw = (
+        "# Sep 25, 2026\n\n## Partner Enablement\n\n"
+        "* **Agentic Weekly Status Pipeline** - Improved the pipeline; see "
+        "implementation change, implementation change, and implementation change; "
+        "supporting PRs: #30, #31, and #32."
+    )
+
+    cleaned = sanitize_report_markdown(raw, payload)
+
+    assert "* **Partner Labs** - Improved the pipeline." in cleaned
+    assert "Agentic Weekly Status Pipeline**" not in cleaned
+    assert "implementation change" not in cleaned
+    assert "supporting PRs" not in cleaned
+
+
 def test_sanitize_report_markdown_strips_gap_commentary() -> None:
     raw = (
         "* **OpenShift Cluster Management Bot** - Merged [PR #30](https://github.com/org/repo/pull/30); "
