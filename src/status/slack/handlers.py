@@ -323,14 +323,6 @@ def register_handlers(app: Any, *, bot_token: str) -> None:
                     return
 
                 entries = get_current_drafts(session, person_id, week_ending)
-                if not entries:
-                    client.chat_postEphemeral(
-                        channel=channel,
-                        user=slack_user_id,
-                        text="No draft entries found to edit.",
-                    )
-                    return
-
                 flags = get_unacknowledged_flags(session, person_id, week_ending)
                 modal = build_edit_modal(
                     person_id=person_id,

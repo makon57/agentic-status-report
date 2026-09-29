@@ -260,6 +260,16 @@ def build_edit_modal(
     Slack allows at most 10 input blocks per modal.
     """
     page_entries = entries[page_offset : page_offset + EDIT_MODAL_MAX_ENTRIES]
+    if entries:
+        instructions = (
+            "edit outcomes below. Leave a field blank to remove that entry. "
+            "Use the field at the bottom to add work the draft missed."
+        )
+    else:
+        instructions = (
+            "no draft entries were generated. Use the field below to add anything "
+            "you would like to report this week."
+        )
 
     blocks: list[dict[str, Any]] = [
         {
@@ -268,8 +278,7 @@ def build_edit_modal(
                 "type": "mrkdwn",
                 "text": (
                     f"*Week ending {week_ending.strftime('%b %d, %Y')}* — "
-                    "edit outcomes below. Leave a field blank to remove that entry. "
-                    "Use the field at the bottom to add work the draft missed."
+                    f"{instructions}"
                 ),
             },
         }
