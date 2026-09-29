@@ -63,9 +63,6 @@ def persist_edited_entries(
 ) -> list[StatusEntry]:
     """Apply per-entry edits without touching unchanged current rows."""
     current_entries = get_current_drafts(session, person_id, week_ending)
-    if not current_entries:
-        return []
-
     by_id = {str(entry.entry_id): entry for entry in current_entries}
     new_entries: list[StatusEntry] = []
 
